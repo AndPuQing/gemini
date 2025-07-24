@@ -163,7 +163,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             pipeline.hincrby(statsKey, 'success', 1);
         } else if (response.status === 429) {
             pipeline.hincrby(statsKey, 'failed', 1);
-            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 600 }); // Disable for 1 hour
+            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 60 }); // Disable for 1 hour
             console.log(
                 `API Key ${randomAPIKey.substring(
                     0,
@@ -177,7 +177,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
         const stats: { success: number; failed: number } | null = await redis.hgetall(statsKey);
         if (stats) {
             const totalRequests = (stats.success || 0) + (stats.failed || 0);
-            if (totalRequests > 20 && ((stats.failed || 0) / totalRequests) > 0.1) {
+            if (totalRequests > 20 && ((stats.failed || 0) / totalRequests) > 0.3) {
                 await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 3600 }); // Disable for 1 hour
                 console.log(
                     `API Key ${randomAPIKey.substring(
