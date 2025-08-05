@@ -163,9 +163,9 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             pipeline.hincrby(statsKey, 'success', 1);
         } else if (response.status === 429) {
             pipeline.hincrby(statsKey, 'failed', 1);
-            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 300 }); // Disable for 5 minutes
+            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 600 }); // Disable for 10 minutes
             console.log(
-                `API Key ${randomAPIKey.substring(0, 10)}... has been disabled for 5 minutes due to rate limiting.`,
+                `API Key ${randomAPIKey.substring(0, 10)}... has been disabled for 10 minutes due to rate limiting.`,
             );
         }
         await pipeline.exec();
