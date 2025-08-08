@@ -180,9 +180,12 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             const backoffCount = (await redis.get<number>(backoffCountKey)) || 0;
             const backoffDuration = Math.min(3600, 600 * Math.pow(2, backoffCount)); // Max 1 hour
 
-            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: backoffDuration });
-            await redis.set(`cooldown:${randomAPIKey}`, "true", { ex: backoffDuration + 3600 }); // 1-hour cooldown after disable
-            await redis.incr(backoffCountKey);
+            const backoffPipeline = redis.pipeline();
+            backoffPipeline.set(`disabled:${randomAPIKey}`, "true", { ex: backoffDuration });
+            backoffPipeline.set(`cooldown:${randomAPIKey}`, "true", { ex: backoffDuration + 3600 }); // 1-hour cooldown after disable
+            backoffPipeline.incr(backoffCountKey);
+            backoffPipeline.expire(backoffCountKey, 86400); // 24-hour expiry/decay for the counter
+            await backoffPipeline.exec();
 
 
             console.log(
