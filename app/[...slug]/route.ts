@@ -16,7 +16,7 @@ function logRequest(request: NextRequest): void {
     console.log("---");
 }
 
-// Get random API key from Vercel Edge Config and return a random one
+// Get random API key from Vercel Edge Config, prioritizing healthy keys
 async function getRandomAPIKey(): Promise<string> {
     const apiKeysEnv = await get<string>("GOOGLE_API_KEYS");
     if (!apiKeysEnv) {
@@ -30,23 +30,34 @@ async function getRandomAPIKey(): Promise<string> {
         throw new Error("No API keys found in environment variable");
     }
 
-    // Filter out disabled keys
-    const availableKeys = [];
+    // Categorize keys into healthy and cooldown
+    const healthyKeys = [];
+    const cooldownKeys = [];
+
     for (const key of apiKeys) {
         const isDisabled = await redis.get(`disabled:${key}`);
-        if (!isDisabled) {
-            availableKeys.push(key);
-        } else {
+        if (isDisabled) {
             console.log(`API Key ${key.substring(0, 10)}... is temporarily disabled.`);
+            continue;
+        }
+
+        const isCooldown = await redis.get(`cooldown:${key}`);
+        if (isCooldown) {
+            cooldownKeys.push(key);
+        } else {
+            healthyKeys.push(key);
         }
     }
 
+    // Prioritize healthy keys, fallback to cooldown keys
+    const availableKeys = healthyKeys.length > 0 ? healthyKeys : cooldownKeys;
+
     if (availableKeys.length === 0) {
-        console.log("Error: All API keys are temporarily disabled");
-        throw new Error("All API keys are temporarily disabled");
+        console.log("Error: All API keys are temporarily disabled or in cooldown");
+        throw new Error("All API keys are temporarily disabled or in cooldown");
     }
 
-    // Select random API key
+    // Select random API key from the chosen category
     const selectedKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
     return selectedKey;
 }
@@ -163,9 +174,19 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             pipeline.hincrby(statsKey, 'success', 1);
         } else if (response.status === 429) {
             pipeline.hincrby(statsKey, 'failed', 1);
-            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 600 }); // Disable for 10 minutes
+
+            // Exponential backoff for rate-limited keys
+            const backoffCountKey = `backoff_count:${randomAPIKey}`;
+            const backoffCount = (await redis.get<number>(backoffCountKey)) || 0;
+            const backoffDuration = Math.min(3600, 600 * Math.pow(2, backoffCount)); // Max 1 hour
+
+            await redis.set(`disabled:${randomAPIKey}`, "true", { ex: backoffDuration });
+            await redis.set(`cooldown:${randomAPIKey}`, "true", { ex: backoffDuration + 3600 }); // 1-hour cooldown after disable
+            await redis.incr(backoffCountKey);
+
+
             console.log(
-                `API Key ${randomAPIKey.substring(0, 10)}... has been disabled for 10 minutes due to rate limiting.`,
+                `API Key ${randomAPIKey.substring(0, 10)}... has been disabled for ${backoffDuration / 60} minutes due to rate limiting.`,
             );
         }
         await pipeline.exec();
@@ -174,8 +195,9 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
         const stats: { success: number; failed: number } | null = await redis.hgetall(statsKey);
         if (stats) {
             const totalRequests = (stats.success || 0) + (stats.failed || 0);
-            if (totalRequests > 20 && ((stats.failed || 0) / totalRequests) > 0.3) {
+            if (totalRequests > 50 && ((stats.failed || 0) / totalRequests) > 0.3) {
                 await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 3600 }); // Disable for 1 hour
+                await redis.set(`cooldown:${randomAPIKey}`, "true", { ex: 7200 }); // 1-hour cooldown after disable
                 console.log(
                     `API Key ${randomAPIKey.substring(
                         0,
