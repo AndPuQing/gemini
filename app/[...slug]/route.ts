@@ -16,17 +16,11 @@ function logRequest(request: NextRequest): void {
     console.log("---");
 }
 
-// Get random API key from Vercel Edge Config, prioritizing healthy keys
-async function getRandomAPIKey(): Promise<string> {
-    const apiKeysEnv = await get<string>("GOOGLE_API_KEYS");
-    if (!apiKeysEnv) {
-        console.log("Error: GOOGLE_API_KEYS not found in Edge Config");
-        throw new Error("GOOGLE_API_KEYS not found in Edge Config");
-    }
 
-    const apiKeys = apiKeysEnv.split(",").map(key => key.trim()).filter(key => key !== "");
+// Get random API key from Vercel Edge Config, prioritizing healthy keys
+async function getRandomAPIKey(apiKeys: string[]): Promise<string> {
     if (apiKeys.length === 0) {
-        console.log("Error: No API keys found in environment variable");
+        console.log(JSON.stringify({ type: "error", msg: "No API keys found in environment variable" }));
         throw new Error("No API keys found in environment variable");
     }
 
@@ -38,7 +32,7 @@ async function getRandomAPIKey(): Promise<string> {
 
     for (let i = 0; i < apiKeys.length; i++) {
         if (disabledKeysResults[i]) {
-            console.log(`API Key ${apiKeys[i].substring(0, 10)}... is temporarily disabled.`);
+            console.log(JSON.stringify({ type: "key_status", key: apiKeys[i], status: "disabled" }));
             continue;
         }
         if (cooldownKeysResults[i]) {
@@ -51,7 +45,7 @@ async function getRandomAPIKey(): Promise<string> {
     const availableKeys = healthyKeys.length > 0 ? healthyKeys : cooldownKeys;
 
     if (availableKeys.length === 0) {
-        console.log("Error: All API keys are temporarily disabled or in cooldown");
+        console.log(JSON.stringify({ type: "error", msg: "All API keys are temporarily disabled or in cooldown" }));
         throw new Error("All API keys are temporarily disabled or in cooldown");
     }
 
@@ -60,16 +54,10 @@ async function getRandomAPIKey(): Promise<string> {
 }
 
 
-async function logKeyAvailability(): Promise<void> {
-    const apiKeysEnv = await get<string>("GOOGLE_API_KEYS");
-    if (!apiKeysEnv) {
-        console.log("Could not retrieve GOOGLE_API_KEYS for logging availability.");
-        return;
-    }
-    const apiKeys = apiKeysEnv.split(",").map(key => key.trim()).filter(key => key !== "");
+async function logKeyAvailability(apiKeys: string[]): Promise<void> {
     const totalKeys = apiKeys.length;
     if (totalKeys === 0) {
-        console.log("No API keys configured.");
+        console.log(JSON.stringify({ type: "error", msg: "No API keys configured." }));
         return;
     }
 
@@ -82,7 +70,7 @@ async function logKeyAvailability(): Promise<void> {
     }
 
     const availabilityRatio = (availableKeys / totalKeys) * 100;
-    console.log(`Key Availability: ${availableKeys}/${totalKeys} (${availabilityRatio.toFixed(2)}%)`);
+    console.log(JSON.stringify({ type: "key_availability", available: availableKeys, total: totalKeys, ratio: availabilityRatio }));
 }
 
 // Validate API key by checking both X-Goog-Api-Key and Authorization headers
@@ -116,6 +104,67 @@ function validateAPIKey(request: NextRequest): boolean {
     return false;
 }
 
+async function handleUpstreamResponse(response: Response, randomAPIKey: string, apiKeys: string[]): Promise<NextResponse> {
+    // Log Google API Key status and update stats in Upstash Redis
+    const pipeline = redis.pipeline();
+    const statsKey = `stats:${randomAPIKey}`;
+
+    if (response.status === 200) {
+        pipeline.hincrby(statsKey, 'success', 1);
+    } else if (response.status === 429) {
+        pipeline.hincrby(statsKey, 'failed', 1);
+
+        // Exponential backoff for rate-limited keys
+        const backoffCountKey = `backoff_count:${randomAPIKey}`;
+        const backoffCount = (await redis.get<number>(backoffCountKey)) || 0;
+        const backoffDuration = Math.min(3600, 600 * Math.pow(2, backoffCount)); // Max 1 hour
+
+        pipeline.set(`disabled:${randomAPIKey}`, "true", { ex: backoffDuration });
+        pipeline.set(`cooldown:${randomAPIKey}`, "true", { ex: backoffDuration + 3600 }); // 1-hour cooldown after disable
+        pipeline.incr(backoffCountKey);
+        pipeline.expire(backoffCountKey, 86400); // 24-hour expiry/decay for the counter
+
+        console.log(JSON.stringify({ type: "key_status", key: randomAPIKey, status: "disabled", reason: "rate_limit", duration: backoffDuration }));
+        await logKeyAvailability(apiKeys); // Log current key availability
+    }
+
+    await pipeline.exec();
+
+    // Disable key if failure rate is high
+    const stats: { success: number; failed: number } | null = await redis.hgetall(statsKey);
+    if (stats) {
+        const totalRequests = (stats.success || 0) + (stats.failed || 0);
+        if (totalRequests > 50 && ((stats.failed || 0) / totalRequests) > 0.3) {
+            const pipeline2 = redis.pipeline();
+            pipeline2.set(`disabled:${randomAPIKey}`, "true", { ex: 3600 }); // Disable for 1 hour
+            pipeline2.set(`cooldown:${randomAPIKey}`, "true", { ex: 7200 }); // 1-hour cooldown after disable
+            await pipeline2.exec();
+            console.log(JSON.stringify({ type: "key_status", key: randomAPIKey, status: "disabled", reason: "high_failure_rate", duration: 3600 }));
+            await logKeyAvailability(apiKeys); // Log current key availability
+        }
+    }
+
+    // Create new response headers
+    const responseHeaders = new Headers(response.headers);
+
+    // If it's a streaming response, ensure correct Content-Type is set
+    if (response.headers.get("Content-Type")?.includes("text/event-stream")) {
+        responseHeaders.set("Content-Type", "text/event-stream; charset=utf-8");
+        responseHeaders.set("Cache-Control", "no-cache");
+        responseHeaders.set("Connection", "keep-alive");
+    }
+
+    // Remove content-encoding to prevent client-side decompression issues
+    responseHeaders.delete("content-encoding");
+
+    // Return proxy response
+    return new NextResponse(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+    });
+}
+
 async function handleRequest(request: NextRequest): Promise<NextResponse> {
     try {
         // Log request information
@@ -131,10 +180,11 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             });
         }
 
-        // Replace API Key with a random one from environment
+        const apiKeysEnv = (await get<string>("GOOGLE_API_KEYS")) || "";
+        const apiKeys = apiKeysEnv.split(",").map(key => key.trim()).filter(key => key !== "");
         let randomAPIKey: string;
         try {
-            randomAPIKey = await getRandomAPIKey();
+            randomAPIKey = await getRandomAPIKey(apiKeys);
             console.log(`Using Google API Key: ${randomAPIKey.substring(0, 10)}...`);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -189,71 +239,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
         // Send request to target server
         const response = await fetch(proxyRequest);
 
-        // Log Google API Key status and update stats in Upstash Redis
-        const pipeline = redis.pipeline();
-        const statsKey = `stats:${randomAPIKey}`;
-
-        if (response.status === 200) {
-            pipeline.hincrby(statsKey, 'success', 1);
-        } else if (response.status === 429) {
-            pipeline.hincrby(statsKey, 'failed', 1);
-
-            // Exponential backoff for rate-limited keys
-            const backoffCountKey = `backoff_count:${randomAPIKey}`;
-            const backoffCount = (await redis.get<number>(backoffCountKey)) || 0;
-            const backoffDuration = Math.min(3600, 600 * Math.pow(2, backoffCount)); // Max 1 hour
-
-            const backoffPipeline = redis.pipeline();
-            backoffPipeline.set(`disabled:${randomAPIKey}`, "true", { ex: backoffDuration });
-            backoffPipeline.set(`cooldown:${randomAPIKey}`, "true", { ex: backoffDuration + 3600 }); // 1-hour cooldown after disable
-            backoffPipeline.incr(backoffCountKey);
-            backoffPipeline.expire(backoffCountKey, 86400); // 24-hour expiry/decay for the counter
-            await backoffPipeline.exec();
-
-
-            console.log(
-                `API Key ${randomAPIKey.substring(0, 10)}... has been disabled for ${backoffDuration / 60} minutes due to rate limiting.`,
-            );
-            await logKeyAvailability(); // Log current key availability
-        }
-        await pipeline.exec();
-
-        // Disable key if failure rate is high
-        const stats: { success: number; failed: number } | null = await redis.hgetall(statsKey);
-        if (stats) {
-            const totalRequests = (stats.success || 0) + (stats.failed || 0);
-            if (totalRequests > 50 && ((stats.failed || 0) / totalRequests) > 0.3) {
-                await redis.set(`disabled:${randomAPIKey}`, "true", { ex: 3600 }); // Disable for 1 hour
-                await redis.set(`cooldown:${randomAPIKey}`, "true", { ex: 7200 }); // 1-hour cooldown after disable
-                console.log(
-                    `API Key ${randomAPIKey.substring(
-                        0,
-                        10,
-                    )}... has been disabled for 1 hour due to high failure rate.`,
-                );
-                await logKeyAvailability(); // Log current key availability
-            }
-        }
-
-        // Create new response headers
-        const responseHeaders = new Headers(response.headers);
-
-        // If it's a streaming response, ensure correct Content-Type is set
-        if (response.headers.get("Content-Type")?.includes("text/event-stream")) {
-            responseHeaders.set("Content-Type", "text/event-stream; charset=utf-8");
-            responseHeaders.set("Cache-Control", "no-cache");
-            responseHeaders.set("Connection", "keep-alive");
-        }
-
-        // Remove content-encoding to prevent client-side decompression issues
-        responseHeaders.delete("content-encoding");
-
-        // Return proxy response
-        return new NextResponse(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: responseHeaders,
-        });
+        return await handleUpstreamResponse(response, randomAPIKey, apiKeys);
 
     } catch (error) {
         console.error("Proxy error:", error);
