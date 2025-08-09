@@ -30,26 +30,24 @@ async function getRandomAPIKey(): Promise<string> {
         throw new Error("No API keys found in environment variable");
     }
 
-    // Categorize keys into healthy and cooldown
+    const disabledKeysResults = await redis.mget(...apiKeys.map(key => `disabled:${key}`));
+    const cooldownKeysResults = await redis.mget(...apiKeys.map(key => `cooldown:${key}`));
+
     const healthyKeys = [];
     const cooldownKeys = [];
 
-    for (const key of apiKeys) {
-        const isDisabled = await redis.get(`disabled:${key}`);
-        if (isDisabled) {
-            console.log(`API Key ${key.substring(0, 10)}... is temporarily disabled.`);
+    for (let i = 0; i < apiKeys.length; i++) {
+        if (disabledKeysResults[i]) {
+            console.log(`API Key ${apiKeys[i].substring(0, 10)}... is temporarily disabled.`);
             continue;
         }
-
-        const isCooldown = await redis.get(`cooldown:${key}`);
-        if (isCooldown) {
-            cooldownKeys.push(key);
+        if (cooldownKeysResults[i]) {
+            cooldownKeys.push(apiKeys[i]);
         } else {
-            healthyKeys.push(key);
+            healthyKeys.push(apiKeys[i]);
         }
     }
 
-    // Prioritize healthy keys, fallback to cooldown keys
     const availableKeys = healthyKeys.length > 0 ? healthyKeys : cooldownKeys;
 
     if (availableKeys.length === 0) {
@@ -57,9 +55,34 @@ async function getRandomAPIKey(): Promise<string> {
         throw new Error("All API keys are temporarily disabled or in cooldown");
     }
 
-    // Select random API key from the chosen category
     const selectedKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
     return selectedKey;
+}
+
+
+async function logKeyAvailability(): Promise<void> {
+    const apiKeysEnv = await get<string>("GOOGLE_API_KEYS");
+    if (!apiKeysEnv) {
+        console.log("Could not retrieve GOOGLE_API_KEYS for logging availability.");
+        return;
+    }
+    const apiKeys = apiKeysEnv.split(",").map(key => key.trim()).filter(key => key !== "");
+    const totalKeys = apiKeys.length;
+    if (totalKeys === 0) {
+        console.log("No API keys configured.");
+        return;
+    }
+
+    const disabledKeysResults = await redis.mget(...apiKeys.map(key => `disabled:${key}`));
+    let availableKeys = 0;
+    for (let i = 0; i < apiKeys.length; i++) {
+        if (!disabledKeysResults[i]) {
+            availableKeys++;
+        }
+    }
+
+    const availabilityRatio = (availableKeys / totalKeys) * 100;
+    console.log(`Key Availability: ${availableKeys}/${totalKeys} (${availabilityRatio.toFixed(2)}%)`);
 }
 
 // Validate API key by checking both X-Goog-Api-Key and Authorization headers
@@ -191,6 +214,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             console.log(
                 `API Key ${randomAPIKey.substring(0, 10)}... has been disabled for ${backoffDuration / 60} minutes due to rate limiting.`,
             );
+            await logKeyAvailability(); // Log current key availability
         }
         await pipeline.exec();
 
@@ -207,6 +231,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
                         10,
                     )}... has been disabled for 1 hour due to high failure rate.`,
                 );
+                await logKeyAvailability(); // Log current key availability
             }
         }
 
