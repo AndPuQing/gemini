@@ -1,6 +1,7 @@
 import { get } from '@vercel/edge-config';
 import { NextRequest, NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
+import { createDecipheriv, scryptSync } from 'crypto';
 
 export const config = {
     runtime: "edge",
@@ -32,7 +33,6 @@ async function getRandomAPIKey(apiKeys: string[]): Promise<string> {
 
     for (let i = 0; i < apiKeys.length; i++) {
         if (disabledKeysResults[i]) {
-            console.log(JSON.stringify({ type: "key_status", key: apiKeys[i], status: "disabled" }));
             continue;
         }
         if (cooldownKeysResults[i]) {
@@ -102,6 +102,33 @@ function validateAPIKey(request: NextRequest): boolean {
 
     console.log("API Key validation: FAILED");
     return false;
+}
+
+// Decrypts the content fetched from Vercel Blob
+async function decrypt(encryptedContent: ArrayBuffer): Promise<string> {
+    const algorithm = 'aes-256-gcm';
+    const ivLength = 16;
+    const authTagLength = 16;
+    const salt = 'a-hardcoded-salt-for-key-derivation'; // Must match the upload script
+
+    const apiKey = process.env.AUTH_API_KEY;
+    if (!apiKey) {
+        throw new Error('AUTH_API_KEY environment variable not set for decryption.');
+    }
+
+    // Derive the key, same as in the upload script
+    const key = scryptSync(apiKey, salt, 32);
+
+    const buffer = Buffer.from(encryptedContent);
+    const iv = buffer.slice(0, ivLength);
+    const authTag = buffer.slice(ivLength, ivLength + authTagLength);
+    const encryptedData = buffer.slice(ivLength + authTagLength);
+
+    const decipher = createDecipheriv(algorithm, key, iv);
+    decipher.setAuthTag(authTag);
+
+    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+    return decrypted.toString('utf-8');
 }
 
 async function handleUpstreamResponse(response: Response, randomAPIKey: string, apiKeys: string[]): Promise<NextResponse> {
@@ -180,8 +207,23 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
             });
         }
 
-        const apiKeysEnv = (await get<string>("GOOGLE_API_KEYS")) || "";
-        const apiKeys = apiKeysEnv.split(",").map(key => key.trim()).filter(key => key !== "");
+        // 1. Get the Blob URL from Edge Config
+        const blobUrl = await get<string>('encryptedUrl');
+        if (!blobUrl) {
+            throw new Error('Could not find blob URL in Edge Config item "encryptedUrl"');
+        }
+
+        // 2. Fetch the encrypted content from Vercel Blob
+        const blobResponse = await fetch(blobUrl);
+        if (!blobResponse.ok) {
+            throw new Error(`Failed to fetch blob: ${blobResponse.statusText}`);
+        }
+        const encryptedContent = await blobResponse.arrayBuffer();
+
+        // 3. Decrypt the content to get the API keys
+        const apiKeysEnv = await decrypt(encryptedContent);
+        // Split by newline, trim whitespace, and filter out empty lines
+        const apiKeys = apiKeysEnv.split(/\r?\n/).map(key => key.trim()).filter(key => key !== "");
         let randomAPIKey: string;
         try {
             randomAPIKey = await getRandomAPIKey(apiKeys);
