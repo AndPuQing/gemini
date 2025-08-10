@@ -9,6 +9,20 @@ export const config = {
 
 const redis = Redis.fromEnv();
 
+// Helper function to perform mget in chunks to avoid request size limits
+async function mgetInChunks(keys: string[], chunkSize: number = 500): Promise<(string | null)[]> {
+    if (keys.length === 0) {
+        return [];
+    }
+    const allResults: (string | null)[] = [];
+    for (let i = 0; i < keys.length; i += chunkSize) {
+        const chunk = keys.slice(i, i + chunkSize);
+        const chunkResults = await redis.mget<(string | null)[]>(...chunk);
+        allResults.push(...chunkResults);
+    }
+    return allResults;
+}
+
 // Log request information for debugging
 function logRequest(request: NextRequest): void {
     console.log(`Request Method: ${request.method}`);
@@ -21,21 +35,25 @@ function logRequest(request: NextRequest): void {
 // Get random API key from Vercel Edge Config, prioritizing healthy keys
 async function getRandomAPIKey(apiKeys: string[]): Promise<string> {
     if (apiKeys.length === 0) {
-        console.log(JSON.stringify({ type: "error", msg: "No API keys found in environment variable" }));
+        console.log("Error: No API keys found in environment variable");
         throw new Error("No API keys found in environment variable");
     }
 
-    const disabledKeysResults = await redis.mget(...apiKeys.map(key => `disabled:${key}`));
-    const cooldownKeysResults = await redis.mget(...apiKeys.map(key => `cooldown:${key}`));
+    // Use chunking for large number of keys
+    const keysToCheck = apiKeys.flatMap(key => [`disabled:${key}`, `cooldown:${key}`]);
+    const results = await mgetInChunks(keysToCheck);
 
     const healthyKeys = [];
     const cooldownKeys = [];
 
     for (let i = 0; i < apiKeys.length; i++) {
-        if (disabledKeysResults[i]) {
-            continue;
+        const isDisabled = results[i * 2];
+        const onCooldown = results[i * 2 + 1];
+
+        if (isDisabled) {
+            continue; // Skip disabled keys
         }
-        if (cooldownKeysResults[i]) {
+        if (onCooldown) {
             cooldownKeys.push(apiKeys[i]);
         } else {
             healthyKeys.push(apiKeys[i]);
@@ -45,7 +63,7 @@ async function getRandomAPIKey(apiKeys: string[]): Promise<string> {
     const availableKeys = healthyKeys.length > 0 ? healthyKeys : cooldownKeys;
 
     if (availableKeys.length === 0) {
-        console.log(JSON.stringify({ type: "error", msg: "All API keys are temporarily disabled or in cooldown" }));
+        console.log("Error: All API keys are temporarily disabled or in cooldown");
         throw new Error("All API keys are temporarily disabled or in cooldown");
     }
 
@@ -57,20 +75,46 @@ async function getRandomAPIKey(apiKeys: string[]): Promise<string> {
 async function logKeyAvailability(apiKeys: string[]): Promise<void> {
     const totalKeys = apiKeys.length;
     if (totalKeys === 0) {
-        console.log(JSON.stringify({ type: "error", msg: "No API keys configured." }));
+        console.log("Key Availability: No API keys configured.");
         return;
     }
 
-    const disabledKeysResults = await redis.mget(...apiKeys.map(key => `disabled:${key}`));
-    let availableKeys = 0;
+    // Use chunking for large number of keys
+    const keysToCheck = apiKeys.flatMap(key => [`disabled:${key}`, `cooldown:${key}`]);
+    const statusResults = await mgetInChunks(keysToCheck);
+
+    const [
+        totalRequests,
+        successfulRequests,
+        failedRequests
+    ] = await Promise.all([
+        redis.get<number>('total_requests'),
+        redis.get<number>('total_successful_requests'),
+        redis.get<number>('total_failed_requests')
+    ]);
+
+    let healthy = 0;
+    let cooldown = 0;
+    let disabled = 0;
+
     for (let i = 0; i < apiKeys.length; i++) {
-        if (!disabledKeysResults[i]) {
-            availableKeys++;
+        const isDisabled = statusResults[i * 2];
+        const onCooldown = statusResults[i * 2 + 1];
+
+        if (isDisabled) {
+            disabled++;
+        } else if (onCooldown) {
+            cooldown++;
+        } else {
+            healthy++;
         }
     }
 
-    const availabilityRatio = (availableKeys / totalKeys) * 100;
-    console.log(JSON.stringify({ type: "key_availability", available: availableKeys, total: totalKeys, ratio: availabilityRatio }));
+    const availableKeys = healthy + cooldown;
+    const availabilityRatio = totalKeys > 0 ? (availableKeys / totalKeys) * 100 : 0;
+    const successRatio = (totalRequests || 0) > 0 ? ((successfulRequests || 0) / (totalRequests || 0)) * 100 : 0;
+
+    console.log(`Key Availability: ${availableKeys}/${totalKeys} (${availabilityRatio.toFixed(2)}%) | Healthy: ${healthy}, Cooldown: ${cooldown}, Disabled: ${disabled} | Requests: ${totalRequests || 0} (Success: ${successfulRequests || 0}, Failed: ${failedRequests || 0}, Success Ratio: ${successRatio.toFixed(2)}%)`);
 }
 
 // Validate API key by checking both X-Goog-Api-Key and Authorization headers
@@ -131,45 +175,81 @@ async function decrypt(encryptedContent: ArrayBuffer): Promise<string> {
     return decrypted.toString('utf-8');
 }
 
+const API_KEYS_CACHE_KEY = 'cached_api_keys';
+const API_KEYS_CACHE_TTL_SECONDS = 600; // 10 minutes
+
+// Get API keys, using a cache to avoid frequent blob reads and decryptions
+async function getApiKeys(): Promise<string[]> {
+    // 1. Try to get from cache first
+    const cachedKeys = await redis.get<string>(API_KEYS_CACHE_KEY);
+    if (cachedKeys) {
+        console.log("API keys cache HIT");
+        return JSON.parse(cachedKeys);
+    }
+
+    console.log("API keys cache MISS");
+
+    // 2. If cache miss, fetch from blob and decrypt
+    const blobUrl = await get<string>('encryptedUrl');
+    if (!blobUrl) {
+        throw new Error('Could not find blob URL in Edge Config item "encryptedUrl"');
+    }
+
+    const blobResponse = await fetch(blobUrl);
+    if (!blobResponse.ok) {
+        throw new Error(`Failed to fetch blob: ${blobResponse.statusText}`);
+    }
+    const encryptedContent = await blobResponse.arrayBuffer();
+
+    const apiKeysEnv = await decrypt(encryptedContent);
+    const apiKeys = apiKeysEnv.split(/\r?\n/).map(key => key.trim()).filter(key => key !== "");
+
+    // 3. Store the fresh keys in cache with a TTL
+    if (apiKeys.length > 0) {
+        // Use pipeline for atomic set and expire, though `set` with `ex` is atomic itself.
+        // This is just good practice.
+        const pipeline = redis.pipeline();
+        pipeline.set(API_KEYS_CACHE_KEY, JSON.stringify(apiKeys), { ex: API_KEYS_CACHE_TTL_SECONDS });
+        await pipeline.exec();
+        console.log(`API keys cached for ${API_KEYS_CACHE_TTL_SECONDS} seconds.`);
+    }
+
+    return apiKeys;
+}
+
 async function handleUpstreamResponse(response: Response, randomAPIKey: string, apiKeys: string[]): Promise<NextResponse> {
-    // Log Google API Key status and update stats in Upstash Redis
     const pipeline = redis.pipeline();
     const statsKey = `stats:${randomAPIKey}`;
+    const nowISO = new Date().toISOString();
+
+    // Always update the last used timestamp
+    pipeline.hset(statsKey, { last_used_at: nowISO });
 
     if (response.status === 200) {
-        pipeline.hincrby(statsKey, 'success', 1);
-    } else if (response.status === 429) {
+        // We will NOT increment success count per key anymore.
+        // But we will record the timestamp of the last successful request.
+        pipeline.hset(statsKey, { last_success_at: nowISO });
+        pipeline.incr('total_successful_requests');
+    } else {
+        // Any non-200 response is considered a failure
         pipeline.hincrby(statsKey, 'failed', 1);
+        pipeline.incr('total_failed_requests'); // Increment global failure counter
 
-        // Exponential backoff for rate-limited keys
-        const backoffCountKey = `backoff_count:${randomAPIKey}`;
-        const backoffCount = (await redis.get<number>(backoffCountKey)) || 0;
-        const backoffDuration = Math.min(3600, 600 * Math.pow(2, backoffCount)); // Max 1 hour
+        if (response.status === 429) {
+            const now = new Date();
+            const tomorrow = new Date(now);
+            tomorrow.setUTCHours(24, 0, 0, 0);
+            const secondsUntilMidnight = Math.floor((tomorrow.getTime() - now.getTime()) / 1000);
 
-        pipeline.set(`disabled:${randomAPIKey}`, "true", { ex: backoffDuration });
-        pipeline.set(`cooldown:${randomAPIKey}`, "true", { ex: backoffDuration + 3600 }); // 1-hour cooldown after disable
-        pipeline.incr(backoffCountKey);
-        pipeline.expire(backoffCountKey, 86400); // 24-hour expiry/decay for the counter
+            pipeline.set(`disabled:${randomAPIKey}`, "true", { ex: secondsUntilMidnight });
+            pipeline.set(`cooldown:${randomAPIKey}`, "true", { ex: secondsUntilMidnight + 300 });
 
-        console.log(JSON.stringify({ type: "key_status", key: randomAPIKey, status: "disabled", reason: "rate_limit", duration: backoffDuration }));
-        await logKeyAvailability(apiKeys); // Log current key availability
+            console.log(`Key ${randomAPIKey} disabled for ${secondsUntilMidnight} seconds due to rate limit.`);
+            await logKeyAvailability(apiKeys);
+        }
     }
 
     await pipeline.exec();
-
-    // Disable key if failure rate is high
-    const stats: { success: number; failed: number } | null = await redis.hgetall(statsKey);
-    if (stats) {
-        const totalRequests = (stats.success || 0) + (stats.failed || 0);
-        if (totalRequests > 50 && ((stats.failed || 0) / totalRequests) > 0.3) {
-            const pipeline2 = redis.pipeline();
-            pipeline2.set(`disabled:${randomAPIKey}`, "true", { ex: 3600 }); // Disable for 1 hour
-            pipeline2.set(`cooldown:${randomAPIKey}`, "true", { ex: 7200 }); // 1-hour cooldown after disable
-            await pipeline2.exec();
-            console.log(JSON.stringify({ type: "key_status", key: randomAPIKey, status: "disabled", reason: "high_failure_rate", duration: 3600 }));
-            await logKeyAvailability(apiKeys); // Log current key availability
-        }
-    }
 
     // Create new response headers
     const responseHeaders = new Headers(response.headers);
@@ -194,6 +274,9 @@ async function handleUpstreamResponse(response: Response, randomAPIKey: string, 
 
 async function handleRequest(request: NextRequest): Promise<NextResponse> {
     try {
+        // Increment global request counter
+        await redis.incr('total_requests');
+
         // Log request information
         logRequest(request);
 
@@ -201,29 +284,13 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
         if (!validateAPIKey(request)) {
             return new NextResponse("Unauthorized: Invalid API Key", {
                 status: 401,
-                headers: {
-                    "Content-Type": "text/plain",
-                },
+                headers: { "Content-Type": "text/plain" },
             });
         }
 
-        // 1. Get the Blob URL from Edge Config
-        const blobUrl = await get<string>('encryptedUrl');
-        if (!blobUrl) {
-            throw new Error('Could not find blob URL in Edge Config item "encryptedUrl"');
-        }
-
-        // 2. Fetch the encrypted content from Vercel Blob
-        const blobResponse = await fetch(blobUrl);
-        if (!blobResponse.ok) {
-            throw new Error(`Failed to fetch blob: ${blobResponse.statusText}`);
-        }
-        const encryptedContent = await blobResponse.arrayBuffer();
-
-        // 3. Decrypt the content to get the API keys
-        const apiKeysEnv = await decrypt(encryptedContent);
-        // Split by newline, trim whitespace, and filter out empty lines
-        const apiKeys = apiKeysEnv.split(/\r?\n/).map(key => key.trim()).filter(key => key !== "");
+        // Get API keys from cache or, if miss, from blob
+        const apiKeys = await getApiKeys();
+        
         let randomAPIKey: string;
         try {
             randomAPIKey = await getRandomAPIKey(apiKeys);
