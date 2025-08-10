@@ -181,10 +181,10 @@ const API_KEYS_CACHE_TTL_SECONDS = 600; // 10 minutes
 // Get API keys, using a cache to avoid frequent blob reads and decryptions
 async function getApiKeys(): Promise<string[]> {
     // 1. Try to get from cache first
-    const cachedKeys = await redis.get<string>(API_KEYS_CACHE_KEY);
+    const cachedKeys = await redis.get<JSON>(API_KEYS_CACHE_KEY);
     if (cachedKeys) {
         console.log("API keys cache HIT");
-        return JSON.parse(cachedKeys);
+        return cachedKeys as unknown as string[];
     }
 
     console.log("API keys cache MISS");
@@ -290,7 +290,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
 
         // Get API keys from cache or, if miss, from blob
         const apiKeys = await getApiKeys();
-        
+
         let randomAPIKey: string;
         try {
             randomAPIKey = await getRandomAPIKey(apiKeys);
