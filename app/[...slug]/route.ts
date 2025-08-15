@@ -358,7 +358,7 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
                 const proxyRequest = new Request(targetURL, {
                     method: request.method,
                     headers: headers,
-                    body: request.body,
+                    body: request.clone().body,
                     // @ts-ignore
                     duplex: 'half',
                 });
