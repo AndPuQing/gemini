@@ -296,64 +296,105 @@ async function handleRequest(request: NextRequest): Promise<NextResponse> {
         // Get API keys from cache or, if miss, from blob
         const apiKeys = await getApiKeys();
 
-        let randomAPIKey: string;
-        try {
-            randomAPIKey = await getRandomAPIKey(apiKeys);
-            console.log(`Using Google API Key: ${randomAPIKey.substring(0, 10)}...`);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            console.log(`Failed to get API key: ${errorMessage}`);
-            return new NextResponse("Internal Server Error: API Key configuration error", {
-                status: 500,
-                headers: {
-                    "Content-Type": "text/plain",
-                },
-            });
+        const maxRetries = 3;
+        let lastResponse: NextResponse | null = null;
+        const triedKeys = new Set<string>();
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            let randomAPIKey: string;
+            try {
+                // Get all healthy keys from Redis
+                const keysToCheck = apiKeys.flatMap(key => [`disabled:${key}`, `cooldown:${key}`]);
+                const results = await mgetInChunks(keysToCheck);
+                const healthyKeys = apiKeys.filter((_, i) => !results[i * 2] && !results[i * 2 + 1]);
+
+                // Filter out keys that have been tried in this request cycle
+                const availableKeys = healthyKeys.filter(k => !triedKeys.has(k));
+
+                if (availableKeys.length === 0) {
+                    console.log("No more healthy API keys available to try.");
+                    if (lastResponse) return lastResponse;
+                    throw new Error("All available API keys have been tried or are on cooldown.");
+                }
+
+                randomAPIKey = availableKeys[Math.floor(Math.random() * availableKeys.length)];
+                triedKeys.add(randomAPIKey);
+                console.log(`Attempt ${attempt}/${maxRetries}: Using Google API Key: ${randomAPIKey.substring(0, 10)}...`);
+
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+                console.log(`Failed to get a healthy API key: ${errorMessage}`);
+                if (lastResponse) return lastResponse;
+                return new NextResponse("Internal Server Error: No healthy API keys available.", {
+                    status: 500,
+                    headers: { "Content-Type": "text/plain" },
+                });
+            }
+
+            try {
+                // Build target URL
+                const url = new URL(request.url);
+                const apiPath = url.pathname || '/';
+                const targetURL = `https://generativelanguage.googleapis.com${apiPath}${url.search}`;
+                console.log(`Target URL: ${targetURL}`);
+
+                // Create new request headers
+                const headers = new Headers(request.headers);
+                headers.set("Host", "generativelanguage.googleapis.com");
+                headers.delete("accept-encoding");
+
+                // Determine authentication method
+                const isOpenAICompatible = apiPath.includes('/openai/');
+                if (isOpenAICompatible) {
+                    headers.set("Authorization", `Bearer ${randomAPIKey}`);
+                    headers.delete("X-Goog-Api-Key");
+                } else {
+                    headers.set("X-Goog-Api-Key", randomAPIKey);
+                    headers.delete("Authorization");
+                }
+                console.log(`Outgoing Headers:`, Object.fromEntries(headers.entries()));
+
+                // Create and send proxy request
+                const proxyRequest = new Request(targetURL, {
+                    method: request.method,
+                    headers: headers,
+                    body: request.body,
+                    // @ts-ignore
+                    duplex: 'half',
+                });
+
+                const response = await fetch(proxyRequest);
+
+                // If the response is successful or a non-retryable error, handle and return it.
+                // We consider any status other than 429 as non-retryable.
+                if (response.status !== 429) {
+                    return await handleUpstreamResponse(response, randomAPIKey, apiKeys);
+                }
+
+                // If we're here, it's a retryable error (429).
+                console.log(`Attempt ${attempt} failed with status ${response.status}. Preparing to retry.`);
+                // Handle the response to mark the key for cooldown, and store it as the last response.
+                lastResponse = await handleUpstreamResponse(response, randomAPIKey, apiKeys);
+
+            } catch (fetchError) {
+                console.error(`Attempt ${attempt} failed with a network error:`, fetchError);
+                lastResponse = new NextResponse("Internal Server Error during fetch", { status: 502 });
+                // A small delay before retrying on network errors might be useful
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
         }
 
-        // Build target URL
-        const url = new URL(request.url);
-        // Use the full pathname as the API path (since all routes come here now)
-        const apiPath = url.pathname || '/';
-        const targetURL = `https://generativelanguage.googleapis.com${apiPath}${url.search}`;
-        console.log(`Target URL: ${targetURL}`);
-
-        // Create new request headers
-        const headers = new Headers(request.headers);
-        headers.set("Host", "generativelanguage.googleapis.com");
-
-        // Remove accept-encoding to prevent gzip compression issues
-        headers.delete("accept-encoding");
-
-        // Determine authentication method based on API path
-        const isOpenAICompatible = apiPath.includes('/openai/');
-
-        if (isOpenAICompatible) {
-            // For OpenAI-compatible endpoints, use Authorization header only
-            headers.set("Authorization", `Bearer ${randomAPIKey}`);
-            headers.delete("X-Goog-Api-Key"); // Remove if exists
-        } else {
-            // For native Gemini endpoints, use X-Goog-Api-Key header only
-            headers.set("X-Goog-Api-Key", randomAPIKey);
-            headers.delete("Authorization"); // Remove if exists
+        // If the loop finishes, all retries have been exhausted. Return the last error response.
+        console.log("All retry attempts failed. Returning the last recorded error response.");
+        if (lastResponse) {
+            return lastResponse;
         }
 
-        // Log outgoing headers
-        console.log(`Outgoing Headers:`, Object.fromEntries(headers.entries()));
-
-        // Create proxy request
-        const proxyRequest = new Request(targetURL, {
-            method: request.method,
-            headers: headers,
-            body: request.body,
-            // @ts-ignore - duplex is required for streaming but not in TS types yet
-            duplex: 'half',
+        // Fallback error if something went wrong and we don't have a lastResponse
+        return new NextResponse("Internal Server Error: All retry attempts failed and no specific error was captured.", {
+            status: 500,
+            headers: { "Content-Type": "text/plain" },
         });
-
-        // Send request to target server
-        const response = await fetch(proxyRequest);
-
-        return await handleUpstreamResponse(response, randomAPIKey, apiKeys);
 
     } catch (error) {
         console.error("Proxy error:", error);
