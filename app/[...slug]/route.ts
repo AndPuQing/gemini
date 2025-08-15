@@ -246,6 +246,11 @@ async function handleUpstreamResponse(response: Response, randomAPIKey: string, 
 
             console.log(`Key ${randomAPIKey} disabled for ${secondsUntilMidnight} seconds due to rate limit.`);
             await logKeyAvailability(apiKeys);
+        } else if (response.status === 400) {
+            // Permanently disable the key for 400 errors
+            pipeline.set(`disabled:${randomAPIKey}`, "true");
+            console.log(`Key ${randomAPIKey} permanently disabled due to 400 Bad Request.`);
+            await logKeyAvailability(apiKeys);
         }
     }
 
